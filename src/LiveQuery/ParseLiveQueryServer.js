@@ -25,11 +25,13 @@ class ParseLiveQueryServer {
   // The subscriber we use to get object update from publisher
   subscriber: Object;
 
+  users: Object;
+
   constructor(server: any, config: any = {}) {
     this.server = server;
     this.clients = new Map();
     this.subscriptions = new Map();
-
+    this.users = {};
     config.appId = config.appId || Parse.applicationId;
     config.masterKey = config.masterKey || Parse.masterKey;
 
@@ -362,6 +364,25 @@ class ParseLiveQueryServer {
         return;
       }
 
+      const userId = parseWebsocket.user;
+      if (Object.hasOwnProperty.call(this.users, userId)) {
+        const user = this.users[userId];
+        // Delete client of user
+        this.users[userId].clients = user.clients.filter(v => v !== clientId);
+
+        // Delete users
+        if (!user.clients.length && typeof user.userStatus !== 'undefined') {
+          delete this.users[userId];
+          const UserStatusObject = Parse.Object.extend('UserStatus');
+          const userStatus = new UserStatusObject();
+          userStatus.id = user.userStatus;
+          userStatus.set('status', 'offline');
+          userStatus.save(null, {
+            useMasterKey: true,
+          });
+        }
+      }
+
       // Delete client
       const client = this.clients.get(clientId);
       this.clients.delete(clientId);
@@ -392,8 +413,6 @@ class ParseLiveQueryServer {
         event: 'ws_disconnect',
         clients: this.clients.size,
         subscriptions: this.subscriptions.size,
-        useMasterKey: client.hasMasterKey,
-        installationId: client.installationId,
       });
     });
 
@@ -574,7 +593,7 @@ class ParseLiveQueryServer {
     return false;
   }
 
-  _handleConnect(parseWebsocket: any, request: any): any {
+  async _handleConnect(parseWebsocket: any, request: any): any {
     if (!this._validateKeys(request, this.keyPairs)) {
       Client.pushError(parseWebsocket, 4, 'Key in request is not valid');
       logger.error('Key in request is not valid');
@@ -582,14 +601,13 @@ class ParseLiveQueryServer {
     }
     const hasMasterKey = this._hasMasterKey(request, this.keyPairs);
     const clientId = uuid();
+    parseWebsocket.clientId = clientId;
     const client = new Client(
       clientId,
       parseWebsocket,
       hasMasterKey,
-      request.sessionToken,
-      request.installationId
+      request.sessionToken
     );
-    parseWebsocket.clientId = clientId;
     this.clients.set(parseWebsocket.clientId, client);
     logger.info(`Create new client: ${parseWebsocket.clientId}`);
     client.pushConnect();
@@ -602,6 +620,54 @@ class ParseLiveQueryServer {
       useMasterKey: client.hasMasterKey,
       installationId: request.installationId,
     });
+
+    // Generate user online.
+    if (request.sessionToken && request.sessionToken.trim().length) {
+      try {
+        Parse.User.enableUnsafeCurrentUser();
+        const user = await Parse.User.become(request.sessionToken);
+
+        parseWebsocket.user = user.get('userid');
+
+        if (typeof this.users[user.get('userid')] === 'undefined') {
+          this.users[user.get('userid')] = {
+            clients: [clientId],
+          };
+
+          let userStatus;
+          const UserStatusObject = Parse.Object.extend('UserStatus');
+          const userStatusQuery = new Parse.Query(UserStatusObject);
+          userStatusQuery.equalTo('user', user);
+          userStatus = await userStatusQuery.first();
+          if (!userStatus) {
+            const acl = new Parse.ACL();
+            acl.setPublicReadAccess(true);
+            acl.setPublicWriteAccess(false);
+            userStatus = new UserStatusObject();
+            userStatus.set('user', user);
+            userStatus.set('userid', user.get('userid'));
+            userStatus.set('status', 'online');
+            userStatus.setACL(acl);
+            userStatus = await userStatus.save(null, {
+              useMasterKey: true,
+            });
+          } else {
+            userStatus.set('status', 'online');
+            userStatus = await userStatus.save(null, {
+              useMasterKey: true,
+            });
+          }
+
+          this.users[user.get('userid')].userStatus = userStatus.id;
+        } else {
+          this.users[user.get('userid')].clients.push(clientId);
+        }
+      } catch (error) {
+        Client.pushError(parseWebsocket, 4, error.message, false);
+        logger.error(error.message);
+        return;
+      }
+    }
   }
 
   _hasMasterKey(request: any, validKeyPairs: any): boolean {
@@ -682,6 +748,9 @@ class ParseLiveQueryServer {
     if (request.sessionToken) {
       subscriptionInfo.sessionToken = request.sessionToken;
     }
+    if (request.installationId) {
+      subscriptionInfo.installationId = request.installationId;
+    }
     client.addSubscriptionInfo(request.requestId, subscriptionInfo);
 
     // Add clientId to subscription
@@ -703,7 +772,7 @@ class ParseLiveQueryServer {
       subscriptions: this.subscriptions.size,
       sessionToken: request.sessionToken,
       useMasterKey: client.hasMasterKey,
-      installationId: client.installationId,
+      installationId: request.installationId,
     });
   }
 
@@ -785,7 +854,7 @@ class ParseLiveQueryServer {
       subscriptions: this.subscriptions.size,
       sessionToken: subscriptionInfo.sessionToken,
       useMasterKey: client.hasMasterKey,
-      installationId: client.installationId,
+      installationId: subscriptionInfo.installationId,
     });
 
     if (!notifyClient) {
